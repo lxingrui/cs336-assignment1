@@ -11,7 +11,10 @@ from torch import Tensor
 
 from cs336_basics.BPE.decode_encode_bpe import Tokenizer
 from cs336_basics.BPE.train_bpe import *
-from cs336_basics.Linear.Linear import Linear
+from cs336_basics.nerual_net.Embedding import Embedding
+from cs336_basics.nerual_net.Linear import Linear
+from cs336_basics.nerual_net.RMSNorm import RMSNorm
+from cs336_basics.nerual_net.SwiGLU import SwiGLU
 
 
 def run_linear(
@@ -23,7 +26,7 @@ def run_linear(
     model = Linear(d_in, d_out, device=weights.device, dtype=weights.dtype)
     state_dict = {"W": weights}
     model.load_state_dict(state_dict)
-    return model.forward(in_features)
+    return model(in_features)
 
 
 def run_embedding(
@@ -32,20 +35,10 @@ def run_embedding(
     weights: Float[Tensor, " vocab_size d_model"],
     token_ids: Int[Tensor, " ..."],
 ) -> Float[Tensor, " ... d_model"]:
-    """
-    Given the weights of an Embedding layer, get the embeddings for a batch of token ids.
-
-    Args:
-        vocab_size (int): The number of embeddings in the vocabulary
-        d_model (int): The size of the embedding dimension
-        weights (Float[Tensor, "vocab_size d_model"]): The embedding vectors to fetch from
-        token_ids (Int[Tensor, "..."]): The set of token ids to fetch from the Embedding layer
-
-    Returns:
-        Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
-    """
-
-    raise NotImplementedError
+    embedding = Embedding(vocab_size, d_model, device=weights.device, dtype=weights.dtype)
+    state_dict = {"W": weights}
+    embedding.load_state_dict(state_dict)
+    return embedding(token_ids)
 
 
 def run_swiglu(
@@ -56,28 +49,11 @@ def run_swiglu(
     w3_weight: Float[Tensor, " d_ff d_model"],
     in_features: Float[Tensor, " ... d_model"],
 ) -> Float[Tensor, " ... d_model"]:
-    """Given the weights of a SwiGLU network, return
-    the output of your implementation with these weights.
+    weights_dict = {"w1": w1_weight, "w2": w2_weight, "w3": w3_weight}
+    swi = SwiGLU(d_model, d_ff, device=w1_weight.device, dtype=w1_weight.dtype)
+    swi.load_state_dict(weights_dict)
 
-    Args:
-        d_model (int): Dimensionality of the feedforward input and output.
-        d_ff (int): Dimensionality of the up-project happening internally to your swiglu.
-        w1_weight (Float[Tensor, "d_ff d_model"]): Stored weights for W1
-        w2_weight (Float[Tensor, "d_model d_ff"]): Stored weights for W2
-        w3_weight (Float[Tensor, "d_ff d_model"]): Stored weights for W3
-        in_features (Float[Tensor, "... d_model"]): Input embeddings to the feed-forward layer.
-
-    Returns:
-        Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
-    """
-    # Example:
-    # If your state dict keys match, you can use `load_state_dict()`
-    # swiglu.load_state_dict(weights)
-    # You can also manually assign the weights
-    # swiglu.w1.weight.data = w1_weight
-    # swiglu.w2.weight.data = w2_weight
-    # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    return swi(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -358,21 +334,10 @@ def run_rmsnorm(
     weights: Float[Tensor, " d_model"],
     in_features: Float[Tensor, " ... d_model"],
 ) -> Float[Tensor, " ... d_model"]:
-    """Given the weights of a RMSNorm affine transform,
-    return the output of running RMSNorm on the input features.
-
-    Args:
-        d_model (int): The dimensionality of the RMSNorm input.
-        eps: (float): A value added to the denominator for numerical stability.
-        weights (Float[Tensor, "d_model"]): RMSNorm weights.
-        in_features (Float[Tensor, "... d_model"]): Input features to run RMSNorm on. Can have arbitrary leading
-            dimensions.
-
-    Returns:
-        Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
-        RMSNorm of the `in_features`.
-    """
-    raise NotImplementedError
+    rms = RMSNorm(d_model, eps, device=weights.device, dtype=weights.dtype)
+    dict_w = {"W": weights}
+    rms.load_state_dict(dict_w)
+    return rms(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
