@@ -4,6 +4,7 @@ import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
+import einops
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
@@ -14,6 +15,7 @@ from cs336_basics.BPE.train_bpe import *
 from cs336_basics.nerual_net.Embedding import Embedding
 from cs336_basics.nerual_net.Linear import Linear
 from cs336_basics.nerual_net.RMSNorm import RMSNorm
+from cs336_basics.nerual_net.RoPE import RoPE
 from cs336_basics.nerual_net.SwiGLU import SwiGLU
 
 
@@ -62,6 +64,12 @@ def run_scaled_dot_product_attention(
     V: Float[Tensor, " ... keys d_v"],
     mask: Bool[Tensor, " ... queries keys"] | None = None,
 ) -> Float[Tensor, " ... queries d_v"]:
+    d_k = Q.size(-1)
+    scores = (Q @ einops.rearrange(K, "... k q -> ... q k")) / d_k**0.5
+    if mask is not None:
+        scores = scores.masked_fill(~mask, float("-inf"))
+    softmax = run_softmax(scores, -1)
+    return softmax @ V
     """
     Given key (K), query (Q), and value (V) tensors, return
     the output of your scaled dot product attention implementation.
@@ -86,6 +94,16 @@ def run_multihead_self_attention(
     o_proj_weight: Float[Tensor, " d_model d_model"],
     in_features: Float[Tensor, " ... sequence_length d_model"],
 ) -> Float[Tensor, " ... sequence_length d_model"]:
+    casual_mask = torch.tril(torch.ones(in_features.size(-2), in_features.size(-2), device=in_features.device)).bool()
+    in_q = in_features @ q_proj_weight.T
+    in_k = in_features @ k_proj_weight.T
+    in_v = in_features @ v_proj_weight.T
+    in_q_head = einops.rearrange(in_q, "... seq (head dim) -> ... head seq dim", head=num_heads)
+    in_k_head = einops.rearrange(in_k, "... seq (head dim) -> ... head seq dim", head=num_heads)
+    in_v_head = einops.rearrange(in_v, "... seq (head dim) -> ... head seq dim", head=num_heads)
+    self_attn_head = run_scaled_dot_product_attention(in_q_head, in_k_head, in_v_head, casual_mask)
+    self_attn = einops.rearrange(self_attn_head, "... head seq dim -> ... seq (head dim)")
+    return self_attn @ o_proj_weight.T
     """
     Given the key, query, and value projection weights of a naive unbatched
     implementation of multi-head attention, return the output of an optimized batched
@@ -108,7 +126,6 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
 
 
 def run_multihead_self_attention_with_rope(
@@ -123,6 +140,22 @@ def run_multihead_self_attention_with_rope(
     in_features: Float[Tensor, " ... sequence_length d_model"],
     token_positions: Int[Tensor, " ... sequence_length"] | None = None,
 ) -> Float[Tensor, " ... sequence_length d_model"]:
+    rope = RoPE(theta, d_model // num_heads, max_seq_len, device=in_features.device)
+    casual_mask = torch.tril(torch.ones(in_features.size(-2), in_features.size(-2), device=in_features.device)).bool()
+    in_q = in_features @ q_proj_weight.T
+    in_k = in_features @ k_proj_weight.T
+    in_v = in_features @ v_proj_weight.T
+    in_q_head = einops.rearrange(in_q, "... seq (head dim) -> ... head seq dim", head=num_heads)
+    in_k_head = einops.rearrange(in_k, "... seq (head dim) -> ... head seq dim", head=num_heads)
+    in_v_head = einops.rearrange(in_v, "... seq (head dim) -> ... head seq dim", head=num_heads)
+    self_attn_head = run_scaled_dot_product_attention(
+        rope(in_q_head, einops.rearrange(token_positions, "... sequence_length -> ... 1 sequence_length")),
+        rope(in_k_head, einops.rearrange(token_positions, "... sequence_length -> ... 1 sequence_length")),
+        in_v_head,
+        casual_mask,
+    )
+    self_attn = einops.rearrange(self_attn_head, "... head seq dim -> ... seq (head dim)")
+    return self_attn @ o_proj_weight.T
     """
     Given the key, query, and value projection weights of a naive unbatched
     implementation of multi-head attention, return the output of an optimized batched
@@ -158,19 +191,8 @@ def run_rope(
     in_query_or_key: Float[Tensor, " ... sequence_length d_k"],
     token_positions: Int[Tensor, " ... sequence_length"],
 ) -> Float[Tensor, " ... sequence_length d_k"]:
-    """
-    Run RoPE for a given input tensor.
-
-    Args:
-        d_k (int): Embedding dimension size for the query or key tensor.
-        theta (float): RoPE parameter.
-        max_seq_len (int): Maximum sequence length to pre-cache if your implementation does that.
-        in_query_or_key (Float[Tensor, "... sequence_length d_k"]): Input tensor to run RoPE on.
-        token_positions (Int[Tensor, "... sequence_length"]): Tensor of shape (batch_size, sequence_length) with the token positions
-    Returns:
-        Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
-    """
-    raise NotImplementedError
+    rope = RoPE(theta, d_k, max_seq_len, device=in_query_or_key.device)
+    return rope(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
@@ -378,19 +400,11 @@ def run_get_batch(
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
-    """
-    Given a tensor of inputs, return the output of softmaxing the given `dim`
-    of the input.
-
-    Args:
-        in_features (Float[Tensor, "..."]): Input features to softmax. Shape is arbitrary.
-        dim (int): Dimension of the `in_features` to apply softmax to.
-
-    Returns:
-        Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
-        softmax normalizing the specified `dim`.
-    """
-    raise NotImplementedError
+    x_max = torch.max(in_features, dim=dim, keepdim=True)
+    x_max_reduced = in_features - x_max[0]
+    x_max_reduced_exp = torch.exp(x_max_reduced)
+    x_sum = x_max_reduced_exp.sum(dim=dim, keepdim=True)
+    return x_max_reduced_exp / x_sum
 
 
 def run_cross_entropy(
