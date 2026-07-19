@@ -140,6 +140,16 @@ def run_multihead_self_attention_with_rope(
     in_features: Float[Tensor, " ... sequence_length d_model"],
     token_positions: Int[Tensor, " ... sequence_length"] | None = None,
 ) -> Float[Tensor, " ... sequence_length d_model"]:
+    device = in_features.device
+    seq_len = in_features.size(-2)
+    # --- 新增：处理 token_positions 为 None 的情况 ---
+    if token_positions is None:
+        # 1. 生成 0 到 seq_len - 1 的基础一维位置张量
+        base_positions = torch.arange(seq_len, device=device)
+        # 2. 动态提取前置的 Batch 维度，并使用 expand 扩展形状
+        batch_shape = in_features.shape[:-2]
+        token_positions = base_positions.expand(*batch_shape, seq_len)
+    # ------------------------------------------------
     rope = RoPE(theta, d_model // num_heads, max_seq_len, device=in_features.device)
     casual_mask = torch.tril(torch.ones(in_features.size(-2), in_features.size(-2), device=in_features.device)).bool()
     in_q = in_features @ q_proj_weight.T
@@ -204,6 +214,29 @@ def run_transformer_block(
     weights: dict[str, Tensor],
     in_features: Float[Tensor, " batch sequence_length d_model"],
 ) -> Float[Tensor, " batch sequence_length d_model"]:
+    ln1_weight = {"W": weights["ln1.weight"]}
+    ln2_weight = {"W": weights["ln2.weight"]}
+    rms1 = RMSNorm(d_model, device=in_features.device)
+    rms1.load_state_dict(ln1_weight)
+    rms2 = RMSNorm(d_model, device=in_features.device)
+    rms2.load_state_dict(ln2_weight)
+    ffn_weight = {"w1": weights["ffn.w1.weight"], "w2": weights["ffn.w2.weight"], "w3": weights["ffn.w3.weight"]}
+    swiglu = SwiGLU(d_model, d_ff, device=in_features.device, dtype=in_features.dtype)
+    swiglu.load_state_dict(ffn_weight)
+    attn = run_multihead_self_attention_with_rope(
+        d_model,
+        num_heads,
+        max_seq_len,
+        theta,
+        weights["attn.q_proj.weight"],
+        weights["attn.k_proj.weight"],
+        weights["attn.v_proj.weight"],
+        weights["attn.output_proj.weight"],
+        rms1(in_features),
+    )
+    residual_attn = in_features + attn
+    ffn = swiglu(rms2(residual_attn))
+    return ffn + residual_attn
     """
     Given the weights of a pre-norm Transformer block and input features,
     return the output of running the Transformer block on the input features.
@@ -279,6 +312,45 @@ def run_transformer_lm(
     weights: dict[str, Tensor],
     in_indices: Int[Tensor, " batch_size sequence_length"],
 ) -> Float[Tensor, " batch_size sequence_length vocab_size"]:
+    device = in_indices.device
+    # 从权重中获取正确的浮点精度（例如 float32 或 float16），避免误用 int64
+    weight_dtype = weights["token_embeddings.weight"].dtype
+
+    # 1. Token Embedding
+    # 注意：这里将第一个参数修正为 vocab_size，防止 Token ID 越界
+    embedd = Embedding(vocab_size, d_model, device=device, dtype=weight_dtype)
+    embedd.load_state_dict({"W": weights["token_embeddings.weight"]})
+    x = embedd(in_indices)  # 输出形状: (batch_size, sequence_length, d_model)
+
+    # 2. 循环计算每一层 Transformer Block（这里使用 for 循环是标准且正确的）
+    for l in range(num_layers):
+        # 2.1 动态提取当前层 weights（过滤并去掉 "layers.{l}." 前缀）
+        # 例如将 "layers.0.ln1.weight" 转化为 "ln1.weight" 传给 run_transformer_block
+        prefix = f"layers.{l}."
+        layer_weights = {k[len(prefix) :]: v for k, v in weights.items() if k.startswith(prefix)}
+
+        # 2.2 将数据送入当前 Transformer 块计算
+        x = run_transformer_block(
+            d_model=d_model,
+            num_heads=num_heads,
+            d_ff=d_ff,
+            max_seq_len=context_length,
+            theta=rope_theta,
+            weights=layer_weights,
+            in_features=x,
+        )
+
+    # 3. Final RMSNorm (对应 ln_final.weight)
+    ln_final = RMSNorm(d_model, device=device, dtype=weight_dtype)
+    ln_final.load_state_dict({"W": weights["ln_final.weight"]})
+    x = ln_final(x)
+
+    # 4. Language Model Head (对应 lm_head.weight)
+    # lm_head.weight 形状为 (vocab_size, d_model)
+    # 通过矩阵乘法将维度从 d_model 映射到 vocab_size 维度
+    logits = x @ weights["lm_head.weight"].T
+
+    return logits
     """Given the weights of a Transformer language model and input indices,
     return the output of running a forward pass on the input indices.
 
@@ -410,6 +482,26 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
 def run_cross_entropy(
     inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
 ) -> Float[Tensor, ""]:
+    # 1. 找到每行的最大值，用于数值稳定（防止 exp 溢出）
+    x_max = torch.max(inputs, dim=1, keepdim=True)[0]
+    x_stable = inputs - x_max
+
+    # 2. 计算分母的 log-sum-exp: log(sum(exp(x_stable)))
+    # 对应公式中的 log(sum(e^(x_i - x_max)))
+    log_sum_exp = torch.log(torch.exp(x_stable).sum(dim=1, keepdim=True))
+
+    # 3. 计算 log_softmax: log(exp(x_i)/sum(exp(x))) = x_stable - log_sum_exp
+    log_softmax = x_stable - log_sum_exp
+
+    # 4. 根据 targets 提取对应真实类别的 log 概率
+    # 使用高级索引（Advanced Indexing）从每一行取出对应 target 列的值
+    batch_size = inputs.shape[0]
+    target_log_probs = log_softmax[torch.arange(batch_size), targets]
+
+    # 5. 计算负对数似然损失（Negative Log Likelihood），并在 batch 上求平均
+    loss = -target_log_probs.mean()
+
+    return loss
     """Given a tensor of inputs and targets, compute the average cross-entropy
     loss across examples.
 
