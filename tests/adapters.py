@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
@@ -17,6 +18,7 @@ from cs336_basics.nerual_net.Linear import Linear
 from cs336_basics.nerual_net.RMSNorm import RMSNorm
 from cs336_basics.nerual_net.RoPE import RoPE
 from cs336_basics.nerual_net.SwiGLU import SwiGLU
+from cs336_basics.Optimizer.AdamW import AdamW
 
 
 def run_linear(
@@ -455,20 +457,34 @@ def run_get_batch(
     Given a dataset (a 1D numpy array of integers) and a desired batch size and
     context length, sample language modeling input sequences and their corresponding
     labels from the dataset.
-
-    Args:
-        dataset (np.array): 1D numpy array of integer token IDs in the dataset.
-        batch_size (int): Desired batch size to sample.
-        context_length (int): Desired context length of each sampled example.
-        device (str): PyTorch device string (e.g., 'cpu' or 'cuda:0') indicating the device
-            to place the sampled input sequences and labels on.
-
-    Returns:
-        Tuple of torch.LongTensors of shape (batch_size, context_length). The first tuple item
-        is the sampled input sequences, and the second tuple item is the corresponding
-        language modeling labels.
     """
-    raise NotImplementedError
+    # 1. 转换类型：将 NumPy 数组转换为 PyTorch 张量
+    # torch.from_numpy 会共享内存，不会发生不必要的内存复制，效率很高。
+    # 随后使用 .long() 或 .to(dtype=torch.long) 转换为 LM 常用的 int64 类型。
+    data_tensor = torch.from_numpy(dataset).to(dtype=torch.long)
+
+    # 2. 确定随机起点的最大安全范围
+    # 输入序列 x 长度为 context_length，目标序列 y 也是 context_length 且向右移动 1 位。
+    # 所以每一组采样实际需要消耗的区间长度为 context_length + 1。
+    # 设起点为 i，则 x 的范围是 [i, i + context_length - 1]，y 的范围是 [i + 1, i + context_length]。
+    # 最大的结束索引不能超过数据集长度减 1（即 len(dataset) - 1）。
+    # 因此有：i + context_length <= len(dataset) - 1  =>  i <= len(dataset) - context_length - 1。
+    # 因为 torch.randint 的上限 (high) 是开区间（不包含），所以上限设为 len(dataset) - context_length。
+    high = len(dataset) - context_length
+    if high <= 0:
+        raise ValueError("数据集长度太短，无法容纳当前的 context_length。")
+
+    # 3. 随机采样起始索引
+    # 生成一个形状为 (batch_size,) 的随机一维张量，每个值代表一个句子的随机起点。
+    ix = torch.randint(0, high, (batch_size,))
+
+    # 4. 根据起点切片并堆叠（Stack）
+    # 使用列表推导式从 data_tensor 中切出对应的输入 x 和目标 y，然后用 torch.stack 拼接成矩阵。
+    x = torch.stack([data_tensor[i : i + context_length] for i in ix])
+    y = torch.stack([data_tensor[i + 1 : i + context_length + 1] for i in ix])
+
+    # 5. 将数据转移到指定的设备（例如 CPU 或 CUDA）
+    return x.to(device), y.to(device)
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -526,14 +542,27 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    # 1. 提取所有有梯度的参数（过滤掉 grad 为 None 的参数）
+    params = [p for p in parameters if p.grad is not None]
+
+    # 2. 计算所有梯度的总 L2 范数
+    total_ssq = sum(p.grad.detach().pow(2).sum() for p in params)
+    total_norm = total_ssq ** (1.0 / 2)
+
+    # 3. 计算缩放比例 (防零除加一个微小值 1e-6)
+    clip_coef = max_l2_norm / (total_norm + 1e-6)
+
+    # 4. 如果总范数超过了 threshold，逐个对 p.grad 原地乘上缩放系数
+    if clip_coef < 1.0:
+        for p in params:
+            p.grad.detach().mul_(clip_coef)  # 注意：是对 p.grad 操作，不是 p
 
 
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -561,7 +590,13 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    if it <= warmup_iters:
+        return max_learning_rate * it / warmup_iters
+    elif it >= cosine_cycle_iters:
+        return min_learning_rate
+    else:
+        cos_part = math.cos(math.pi * (it - warmup_iters) / (cosine_cycle_iters - warmup_iters))
+        return min_learning_rate + 0.5 * (max_learning_rate - min_learning_rate) * (1 + cos_part)
 
 
 def run_save_checkpoint(
@@ -580,7 +615,14 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    model_state = model.state_dict()
+    optimizer_state = optimizer.state_dict()
+    checkpoint = {
+        "model": model_state,
+        "optimizer": optimizer_state,
+        "iteration": iteration,
+    }
+    torch.save(checkpoint, out)
 
 
 def run_load_checkpoint(
@@ -601,7 +643,10 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    checkpoint_dict = torch.load(src)
+    model.load_state_dict(checkpoint_dict["model"])
+    optimizer.load_state_dict(checkpoint_dict["optimizer"])
+    return checkpoint_dict["iteration"]
 
 
 def get_tokenizer(
